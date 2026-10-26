@@ -1,0 +1,410 @@
+name: Generate Project and Build APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Generate Android Project Files
+        run: |
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/java/com/example/drivezoneinspector/model
+          mkdir -p app/src/main/java/com/example/drivezoneinspector/util
+          mkdir -p app/src/main/java/com/example/drivezoneinspector/viewmodel
+          mkdir -p app/src/main/java/com/example/drivezoneinspector/ui
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "DriveZoneSaveInspector"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.4.1" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.23" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.drivezoneinspector"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.drivezoneinspector"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.11"
+              }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.05.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.0")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_menu_search"
+                  android:label="Drive Zone Save Inspector"
+                  android:roundIcon="@android:drawable/ic_menu_search"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/model/InspectionModels.kt
+          package com.example.drivezoneinspector.model
+          import android.net.Uri
+          enum class DetectedFormat { JSON, XML, PLAIN_TEXT, BINARY_OR_ENCRYPTED, UNKNOWN }
+          data class NumericField(val keyPath: String, var value: Double, val isInteger: Boolean)
+          data class InspectedFile(val uri: Uri, val fileName: String, val fileSizeFormatted: String, val format: DetectedFormat, val rawPreviewText: String?, val detectedNumbers: List<NumericField>, val isEditableText: Boolean)
+          data class BackupItem(val fileName: String, val dateCreated: String, val absolutePath: String)
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/util/FileParser.kt
+          package com.example.drivezoneinspector.util
+          import com.example.drivezoneinspector.model.DetectedFormat
+          import com.example.drivezoneinspector.model.NumericField
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.xmlpull.v1.XmlPullParser
+          import org.xmlpull.v1.XmlPullParserFactory
+          import java.io.StringReader
+          object FileParser {
+              fun isBinary(bytes: ByteArray): Boolean {
+                  var count = 0
+                  val sample = minOf(bytes.size, 1024)
+                  for (i in 0 until sample) {
+                      val b = bytes[i].toInt()
+                      if (b == 0) return true
+                      if (b < 0x09 || (b in 0x0E..0x1F)) count++
+                  }
+                  return if (sample == 0) false else (count.toFloat() / sample.toFloat()) > 0.15f
+              }
+              fun detectFormat(text: String): DetectedFormat {
+                  val t = text.trim()
+                  if (t.isEmpty()) return DetectedFormat.PLAIN_TEXT
+                  if ((t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))) {
+                      try {
+                          if (t.startsWith("{")) JSONObject(t) else JSONArray(t)
+                          return DetectedFormat.JSON
+                      } catch (_: Exception) {}
+                  }
+                  if (t.startsWith("<") && t.endsWith(">")) {
+                      try {
+                          val f = XmlPullParserFactory.newInstance()
+                          val p = f.newPullParser()
+                          p.setInput(StringReader(t))
+                          var e = p.eventType
+                          var tags = 0
+                          while (e != XmlPullParser.END_DOCUMENT) {
+                              if (e == XmlPullParser.START_TAG) tags++
+                              e = p.next()
+                          }
+                          if (tags > 0) return DetectedFormat.XML
+                      } catch (_: Exception) {}
+                  }
+                  return DetectedFormat.PLAIN_TEXT
+              }
+              fun extractNumericFields(text: String, format: DetectedFormat): List<NumericField> {
+                  val list = mutableListOf<NumericField>()
+                  when (format) {
+                      DetectedFormat.JSON -> {
+                          try {
+                              val t = text.trim()
+                              if (t.startsWith("{")) parseJson(JSONObject(t), "root", list)
+                          } catch (_: Exception) {}
+                      }
+                      DetectedFormat.XML, DetectedFormat.PLAIN_TEXT -> {
+                          val r = Regex("""([a-zA-Z0-9_\.\-]+)\s*[:=]\s*(-?\d+(?:\.\d+)?)""")
+                          r.findAll(text).forEach { m ->
+                              val k = m.groupValues[1]
+                              val s = m.groupValues[2]
+                              val num = s.toDoubleOrNull()
+                              if (num != null) list.add(NumericField(k, num, !s.contains(".")))
+                          }
+                      }
+                      else -> {}
+                  }
+                  return list
+              }
+              private fun parseJson(obj: JSONObject, path: String, list: MutableList<NumericField>) {
+                  val keys = obj.keys()
+                  while (keys.hasNext()) {
+                      val k = keys.next()
+                      val v = obj.get(k)
+                      val p = "$path.$k"
+                      when (v) {
+                          is Number -> list.add(NumericField(p, v.toDouble(), v is Int || v is Long))
+                          is JSONObject -> parseJson(v, p, list)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/util/BackupManager.kt
+          package com.example.drivezoneinspector.util
+          import android.content.Context
+          import android.net.Uri
+          import com.example.drivezoneinspector.model.BackupItem
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          class BackupManager(private val context: Context) {
+              private val folder: File get() = File(context.filesDir, "backups").apply { if (!exists()) mkdirs() }
+              fun createBackup(uri: Uri, name: String): BackupItem? {
+                  return try {
+                      val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                      val safe = name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                      val f = File(folder, "backup_${ts}_$safe")
+                      context.contentResolver.openInputStream(uri)?.use { input ->
+                          FileOutputStream(f).use { output -> input.copyTo(output) }
+                      }
+                      BackupItem(f.name, SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.getDefault()).format(Date()), f.absolutePath)
+                  } catch (e: Exception) { null }
+              }
+              fun getBackups(): List<BackupItem> {
+                  val files = folder.listFiles() ?: return emptyList()
+                  return files.sortedByDescending { it.lastModified() }.map {
+                      BackupItem(it.name, SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.getDefault()).format(Date(it.lastModified())), it.absolutePath)
+                  }
+              }
+              fun restoreBackupToUri(path: String, dest: Uri): Boolean {
+                  return try {
+                      val src = File(path)
+                      if (!src.exists()) return false
+                      src.inputStream().use { input ->
+                          context.contentResolver.openOutputStream(dest)?.use { output -> input.copyTo(output) }
+                      }
+                      true
+                  } catch (e: Exception) { false }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/viewmodel/InspectorViewModel.kt
+          package com.example.drivezoneinspector.viewmodel
+          import android.app.Application
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import com.example.drivezoneinspector.model.*
+          import com.example.drivezoneinspector.util.*
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.*
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayOutputStream
+          import java.util.Locale
+          sealed class UIStatus {
+              data object Idle : UIStatus()
+              data object Loading : UIStatus()
+              data class Success(val message: String) : UIStatus()
+              data class Error(val message: String) : UIStatus()
+          }
+          class InspectorViewModel(application: Application) : AndroidViewModel(application) {
+              private val backupManager = BackupManager(application)
+              private val _currentFile = MutableStateFlow<InspectedFile?>(null)
+              val currentFile: StateFlow<InspectedFile?> = _currentFile.asStateFlow()
+              private val _status = MutableStateFlow<UIStatus>(UIStatus.Idle)
+              val status: StateFlow<UIStatus> = _status.asStateFlow()
+              private val _backups = MutableStateFlow<List<BackupItem>>(emptyList())
+              val backups: StateFlow<List<BackupItem>> = _backups.asStateFlow()
+              init { loadBackups() }
+              fun loadBackups() {
+                  viewModelScope.launch(Dispatchers.IO) { _backups.value = backupManager.getBackups() }
+              }
+              fun processSelectedFile(uri: Uri) {
+                  viewModelScope.launch {
+                      _status.value = UIStatus.Loading
+                      try {
+                          val ctx = getApplication<Application>()
+                          var name = "save_file"
+                          var size = 0L
+                          ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                              val nIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              val sIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                              if (c.moveToFirst()) {
+                                  if (nIdx != -1) name = c.getString(nIdx) ?: name
+                                  if (sIdx != -1) size = c.getLong(sIdx)
+                              }
+                          }
+                          withContext(Dispatchers.IO) { backupManager.createBackup(uri, name) }
+                          loadBackups()
+                          val bytes = withContext(Dispatchers.IO) {
+                              val out = ByteArrayOutputStream()
+                              ctx.contentResolver.openInputStream(uri)?.use { inp -> inp.copyTo(out) }
+                              out.toByteArray()
+                          }
+                          if (FileParser.isBinary(bytes)) {
+                              _currentFile.value = InspectedFile(uri, name, "${bytes.size} B", DetectedFormat.BINARY_OR_ENCRYPTED, null, emptyList(), false)
+                          } else {
+                              val text = String(bytes, Charsets.UTF_8)
+                              val fmt = FileParser.detectFormat(text)
+                              val nums = FileParser.extractNumericFields(text, fmt)
+                              _currentFile.value = InspectedFile(uri, name, "${bytes.size} B", fmt, text.take(5000), nums, true)
+                          }
+                          _status.value = UIStatus.Success("Loaded safely. Backup saved.")
+                      } catch (e: Exception) {
+                          _status.value = UIStatus.Error("Error: ${e.localizedMessage}")
+                      }
+                  }
+              }
+              fun exportModifiedCopy(dest: Uri, field: NumericField, newVal: Double) {
+                  viewModelScope.launch(Dispatchers.IO) {
+                      _status.value = UIStatus.Loading
+                      try {
+                          val text = _currentFile.value?.rawPreviewText ?: return@launch
+                          val p = Regex("(${Regex.escape(field.keyPath)}\\s*[:=]\\s*)(-?\\d+(?:\\.\\d+)?)")
+                          val vStr = if (field.isInteger) newVal.toLong().toString() else newVal.toString()
+                          val replaced = p.replaceFirst(text, "$1$vStr")
+                          getApplication<Application>().contentResolver.openOutputStream(dest)?.use {
+                              it.write(replaced.toByteArray(Charsets.UTF_8))
+                          }
+                          _status.value = UIStatus.Success("Exported to new copy safely.")
+                      } catch (e: Exception) {
+                          _status.value = UIStatus.Error("Export failed: ${e.localizedMessage}")
+                      }
+                  }
+              }
+              fun restoreBackupToExternal(item: BackupItem, dest: Uri) {
+                  viewModelScope.launch(Dispatchers.IO) {
+                      if (backupManager.restoreBackupToUri(item.absolutePath, dest)) {
+                          _status.value = UIStatus.Success("Backup restored.")
+                      } else {
+                          _status.value = UIStatus.Error("Restore failed.")
+                      }
+                  }
+              }
+              fun resetStatus() { _status.value = UIStatus.Idle }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/ui/Theme.kt
+          package com.example.drivezoneinspector.ui
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Color(0xFF90CAF9),
+                      surface = Color(0xFF1E1E1E),
+                      background = Color(0xFF121212)
+                  ),
+                  content = content
+              )
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/drivezoneinspector/ui/InspectorDashboard.kt
+          package com.example.drivezoneinspector.ui
+          import android.net.Uri
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.example.drivezoneinspector.model.*
+          import com.example.drivezoneinspector.viewmodel.*
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun InspectorDashboard(viewModel: InspectorViewModel) {
+              val currentFile by viewModel.currentFile.collectAsState()
+              val status by viewModel.status.collectAsState()
+              val backups by viewModel.backups.collectAsState()
+              var showBackups by remember { mutableStateOf(false) }
+              var selectedNum by remember { mutableStateOf<NumericField?>(null) }
+              var inputVal by remember { mutableStateOf("") }
+              var backupTarget by remember { mutableStateOf<BackupItem?>(null) }
+              val snackState = remember { SnackbarHostState() }
+
+              val openDoc = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { viewModel.processSelectedFile(it) } }
+              val exportDoc = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(
